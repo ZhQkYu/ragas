@@ -26,6 +26,8 @@ from ragas.testset.synthesizers.prompts import (
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
 
+import asyncio
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +74,7 @@ class MultiHopAbstractQuerySynthesizer(MultiHopQuerySynthesizer):
         4. Sample diverse combinations of scenarios to get n samples
         """
 
+        max_concurrency = 32
         node_clusters = self.get_node_clusters(knowledge_graph)
         scenarios = []
 
@@ -80,48 +83,60 @@ class MultiHopAbstractQuerySynthesizer(MultiHopQuerySynthesizer):
                 "No clusters found in the knowledge graph. Try changing the relationship condition."
             )
         num_sample_per_cluster = int(np.ceil(n / len(node_clusters)))
+        concurrency = min(len(node_clusters), max_concurrency)
+        semaphore = asyncio.Semaphore(concurrency)
 
-        for cluster in node_clusters:
-            if len(scenarios) >= n:
-                break
-            nodes = []
-            for node in cluster:
-                child_nodes = get_child_nodes(node, knowledge_graph, level=1)
-                if child_nodes:
-                    nodes.extend(child_nodes)
-                else:
-                    nodes.append(node)
+        async def process_cluster(cluster):
+            async with semaphore:
+                if len(scenarios) >= n:
+                    return []
+                nodes = []
+                for node in cluster:
+                    child_nodes = get_child_nodes(node, knowledge_graph, level=1)
+                    if child_nodes:
+                        nodes.extend(child_nodes)
+                    else:
+                        nodes.append(node)
 
-            base_scenarios = []
-            node_themes = [node.properties.get("themes", []) for node in nodes]
-            prompt_input = ConceptsList(
-                lists_of_concepts=node_themes, max_combinations=num_sample_per_cluster
-            )
-            concept_combination = await self.concept_combination_prompt.generate(
-                data=prompt_input, llm=self.llm, callbacks=callbacks
-            )
-            flattened_themes = [
-                theme
-                for sublist in concept_combination.combinations
-                for theme in sublist
-            ]
-            prompt_input = ThemesPersonasInput(
-                themes=flattened_themes, personas=persona_list
-            )
-            persona_concepts = await self.theme_persona_matching_prompt.generate(
-                data=prompt_input, llm=self.llm, callbacks=callbacks
-            )
+                base_scenarios = []
+                node_themes = [node.properties.get("themes", []) for node in nodes]
+                prompt_input = ConceptsList(
+                    lists_of_concepts=node_themes, max_combinations=num_sample_per_cluster
+                )
+                concept_combination = await self.concept_combination_prompt.generate(
+                    data=prompt_input, llm=self.llm, callbacks=callbacks
+                )
+                flattened_themes = [
+                    theme
+                    for sublist in concept_combination.combinations
+                    for theme in sublist
+                ]
+                prompt_input = ThemesPersonasInput(
+                    themes=flattened_themes, personas=persona_list
+                )
+                persona_concepts = await self.theme_persona_matching_prompt.generate(
+                    data=prompt_input, llm=self.llm, callbacks=callbacks
+                )
 
-            base_scenarios = self.prepare_combinations(
-                nodes,
-                concept_combination.combinations,
-                personas=persona_list,
-                persona_item_mapping=persona_concepts.mapping,
-                property_name="themes",
-            )
-            base_scenarios = self.sample_diverse_combinations(
-                base_scenarios, num_sample_per_cluster
-            )
-            scenarios.extend(base_scenarios)
+                base_scenarios = self.prepare_combinations(
+                    nodes,
+                    concept_combination.combinations,
+                    personas=persona_list,
+                    persona_item_mapping=persona_concepts.mapping,
+                    property_name="themes",
+                )
+                return self.sample_diverse_combinations(
+                    base_scenarios, num_sample_per_cluster
+                )
+            
+        async def bounded_gather():
+            tasks = [process_cluster(cluster) for cluster in node_clusters]
+            results = await asyncio.gather(*tasks)
+            for res in results:
+                if res:
+                    scenarios.extend(res)
+                    if len(scenarios) >= n:
+                        break
 
-        return scenarios
+        await bounded_gather()
+        return scenarios[:n]

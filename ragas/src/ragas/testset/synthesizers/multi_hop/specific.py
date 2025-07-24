@@ -22,6 +22,8 @@ from ragas.testset.synthesizers.prompts import (
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
 
+import asyncio
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,7 +74,8 @@ class MultiHopSpecificQuerySynthesizer(MultiHopQuerySynthesizer):
             3. Sample num_sample_per_cluster scenarios from the list of scenarios
         4. Return the list of scenarios of length n
         """
-
+        
+        max_concurrency = 32
         triplets = self.get_node_clusters(knowledge_graph)
 
         if len(triplets) == 0:
@@ -82,9 +85,15 @@ class MultiHopSpecificQuerySynthesizer(MultiHopQuerySynthesizer):
 
         num_sample_per_cluster = int(np.ceil(n / len(triplets)))
         scenarios = []
+        
+        concurrency = min(len(triplets), max_concurrency)
+        semaphore = asyncio.Semaphore(concurrency)
 
-        for triplet in triplets:
-            if len(scenarios) < n:
+        async def process_triplet(triplet):
+            async with semaphore:
+                if len(scenarios) >= n:
+                    return []
+                
                 node_a, node_b = triplet[0], triplet[-1]
                 overlapped_items = []
                 overlapped_items = triplet[1].properties["overlapped_items"]
@@ -106,9 +115,18 @@ class MultiHopSpecificQuerySynthesizer(MultiHopQuerySynthesizer):
                         persona_item_mapping=persona_concepts.mapping,
                         property_name=self.property_name,
                     )
-                    base_scenarios = self.sample_diverse_combinations(
+
+                    return self.sample_diverse_combinations(
                         base_scenarios, num_sample_per_cluster
                     )
-                    scenarios.extend(base_scenarios)
+        async def bounded_gather():
+            tasks = [process_triplet(triplet) for triplet in triplets]
+            results = await asyncio.gather(*tasks)
+            for res in results:
+                if res:
+                    scenarios.extend(res)
+                    if len(scenarios) >= n:
+                        break
 
-        return scenarios
+        await bounded_gather()
+        return scenarios[:n]

@@ -21,6 +21,8 @@ from .base import SingleHopQuerySynthesizer
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
 
+import asyncio
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,26 +95,43 @@ class SingleHopSpecificQuerySynthesizer(SingleHopQuerySynthesizer):
         4. Return the list of scenarios
         """
 
+        max_concurrency = 32
         nodes = self.get_node_clusters(knowledge_graph)
         if len(nodes) == 0:
             raise ValueError("No nodes found with the `entities` property.")
         samples_per_node = int(np.ceil(n / len(nodes)))
 
         scenarios = []
-        for node in nodes:
-            if len(scenarios) >= n:
-                break
-            themes = node.properties.get(self.property_name, [""])
-            prompt_input = ThemesPersonasInput(themes=themes, personas=persona_list)
-            persona_concepts = await self.theme_persona_matching_prompt.generate(
-                data=prompt_input, llm=self.llm, callbacks=callbacks
-            )
-            base_scenarios = self.prepare_combinations(
-                node,
-                themes,
-                personas=persona_list,
-                persona_concepts=persona_concepts.mapping,
-            )
-            scenarios.extend(self.sample_combinations(base_scenarios, samples_per_node))
+        
+        concurrency = min(len(nodes), max_concurrency)
+        semaphore = asyncio.Semaphore(concurrency)
 
-        return scenarios
+        async def process_node(node):
+            async with semaphore:
+                if len(scenarios) >= n:
+                    return []
+                themes = node.properties.get(self.property_name, [""])
+                prompt_input = ThemesPersonasInput(themes=themes, personas=persona_list)
+                persona_concepts = await self.theme_persona_matching_prompt.generate(
+                    data=prompt_input, llm=self.llm, callbacks=callbacks
+                )
+                base_scenarios = self.prepare_combinations(
+                    node,
+                    themes,
+                    personas=persona_list,
+                    persona_concepts=persona_concepts.mapping,
+                )
+
+                return self.sample_combinations(base_scenarios, samples_per_node)
+
+        async def bounded_gather():
+            tasks = [process_node(node) for node in nodes]
+            results = await asyncio.gather(*tasks)
+            for res in results:
+                if res:
+                    scenarios.extend(res)
+                    if len(scenarios) >= n:
+                        break
+        
+        await bounded_gather()
+        return scenarios[:n]
